@@ -607,11 +607,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (!response.ok) {
                 const errData = await response.json().catch(() => ({}));
-                showToast(`Error en el servidor: ${errData.detail || 'Error desconocido'}`, 'error', 6000);
-                throw new Error('Server Error');
+                const errorMsg = errData.detail || errData.error || `Error ${response.status}: Error en el servidor`;
+                showToast(`Error en el servidor: ${errorMsg}`, 'error', 8000);
+                const err = new Error(errorMsg);
+                err._toastShown = true;
+                throw err;
             }
 
             const data = await response.json();
+
+            // Verificar si módulos individuales tuvieron error
+            const failedModules = Object.entries(data)
+                .filter(([k, v]) => k !== 'metricas' && v && v.ok === false);
+                
+            if (failedModules.length > 0) {
+                const primerError = failedModules[0][1]?.error || 'Error desconocido';
+                showToast(`Atención: ${failedModules.length} módulos no pudieron completarse (${primerError})`, 'warning', 8000);
+            }
 
             btnAnalyze.innerHTML = originalText;
             btnAnalyze.style.backgroundColor = 'var(--c-red)';
@@ -626,7 +638,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             console.error(err);
-            showToast('Error al procesar el análisis.', 'error', 6000);
+            if (!err._toastShown) {
+                showToast(`Error al procesar el análisis: ${err.message || 'Error de conexión'}`, 'error', 6000);
+            }
             btnAnalyze.innerHTML = originalText;
             btnAnalyze.style.backgroundColor = '';
             badges.forEach(b => {

@@ -15,6 +15,7 @@ textstat.set_lang('es')
 from collections import Counter
 import json
 import re
+import math
 from typing import Dict, Any, Optional
 import concurrent.futures
 from dotenv import load_dotenv
@@ -28,6 +29,72 @@ load_dotenv()
 
 # SSL verification: set DISABLE_SSL_VERIFY=true in .env only for corporate proxies
 _SSL_VERIFY = os.environ.get('DISABLE_SSL_VERIFY', 'false').lower() != 'true'
+
+# Helper to sanitize and retrieve Anthropic API key from request or env variables
+def get_clean_api_key(req_key: Optional[str] = None) -> Optional[str]:
+    raw_key = req_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY") or os.environ.get("API_KEY")
+    if not raw_key:
+        return None
+    cleaned = str(raw_key).strip().strip('"\'')
+    return cleaned if cleaned else None
+
+# Helper to ensure compatibility with Pydantic v1, v2 and raw dicts
+def get_dict_from_model(model_obj) -> dict:
+    if model_obj is None:
+        return {}
+    if isinstance(model_obj, dict):
+        return model_obj
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    return {}
+
+# Model lists with robust automatic fallback
+DEFAULT_SONNET_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+SONNET_MODELS_FALLBACK = [
+    DEFAULT_SONNET_MODEL,
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-20250514",
+    "claude-3-5-sonnet-latest",
+    "claude-3-7-sonnet-latest",
+    "claude-3-5-sonnet-20241022",
+    "claude-haiku-4-5-20251001",
+    "claude-3-5-haiku-latest",
+]
+SONNET_MODELS = list(dict.fromkeys(SONNET_MODELS_FALLBACK))
+
+DEFAULT_HAIKU_MODEL = os.environ.get("ANTHROPIC_HAIKU_MODEL", "claude-haiku-4-5-20251001")
+HAIKU_MODELS_FALLBACK = [
+    DEFAULT_HAIKU_MODEL,
+    "claude-haiku-4-5",
+    "claude-3-5-haiku-latest",
+    "claude-3-5-haiku-20241022",
+    "claude-3-haiku-20240307",
+]
+HAIKU_MODELS = list(dict.fromkeys(HAIKU_MODELS_FALLBACK))
+
+def call_claude_with_fallback(client: anthropic.Anthropic, prompt: str, models: list, max_tokens: int = 8192) -> str:
+    last_err = None
+    for model_name in models:
+        try:
+            response = client.messages.create(
+                model=model_name,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            if response and response.content:
+                return response.content[0].text.strip()
+            raise ValueError("Respuesta vacía del modelo de Claude.")
+        except Exception as e:
+            err_str = str(e).lower()
+            last_err = e
+            # Solo probar el siguiente modelo si es un error de modelo no encontrado o deprecado
+            if "not_found" in err_str or "not found" in err_str or "model:" in err_str or "invalid_request_error" in err_str:
+                continue
+            # Para errores de auth (401), rate limits (429), saldo, etc., detenerse y propagar
+            raise e
+    raise last_err
 
 app = FastAPI(title="PitchLab360")
 
@@ -179,25 +246,17 @@ def chunk_text_for_cleaning(texto: str, word_chunk=1000) -> list:
 
 @app.post("/limpiar-texto")
 def limpiar_texto(req: CleanRequest):
-    # Use key from request (UI) or fall back to .env
-    key = req.api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return {"error": "API Key de Anthropic no configurada. Ingrésala en el panel de YouTube o en el archivo .env."}
-        
-    http_client = httpx.Client(verify=_SSL_VERIFY, timeout=300.0)
-    client = anthropic.Anthropic(api_key=key, http_client=http_client)
-    
-    
-    def clean_chunk(chunk: str) -> str:
-        prompt = PROMPT_LIMPIEZA.format(texto=chunk)
-        res = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return res.content[0].text.strip()
-        
     try:
+        key = get_clean_api_key(req.api_key)
+        if not key:
+            return {"error": "API Key de Anthropic no configurada. Ingrésala en el panel de YouTube o en el archivo .env / Railway (ANTHROPIC_API_KEY)."}
+            
+        def clean_chunk(chunk: str) -> str:
+            prompt = PROMPT_LIMPIEZA.format(texto=chunk)
+            with httpx.Client(verify=_SSL_VERIFY, timeout=300.0) as http_client:
+                client = anthropic.Anthropic(api_key=key, http_client=http_client)
+                return call_claude_with_fallback(client, prompt, HAIKU_MODELS, max_tokens=2048)
+            
         chunks = chunk_text_for_cleaning(req.texto, word_chunk=800)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(clean_chunk, ch) for ch in chunks]
@@ -244,10 +303,12 @@ def calcular_metricas(texto: str) -> dict:
     try:
         n_oraciones = textstat.sentence_count(texto) or 1
         legibilidad = textstat.flesch_reading_ease(texto)
+        if legibilidad is None or not isinstance(legibilidad, (int, float)) or legibilidad != legibilidad or math.isinf(legibilidad):
+            legibilidad = 0.0
     except Exception:
         # Fallback si textstat falla por falta de datos NLTK
         n_oraciones = max(1, texto.count('.') + texto.count('?') + texto.count('!'))
-        legibilidad = 0
+        legibilidad = 0.0
     
     n_nos = sum(1 for t in tokens if t in NOSOTROS)
     n_ell = sum(1 for t in tokens if t in ELLOS)
@@ -458,68 +519,80 @@ En "limitaciones": 2-3 limitaciones honestas del análisis computacional para es
 }
 
 def ejecutar_modulo(modulo: str, texto: str, metadatos: dict, metricas: dict, api_key: str = None) -> dict:
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return {"ok": False, "error": "API Key de Anthropic no configurada. Ingrésala en el panel de YouTube o en el archivo .env."}
-        
-    http_client = httpx.Client(verify=_SSL_VERIFY, timeout=300.0)
-    client = anthropic.Anthropic(api_key=key, http_client=http_client)
-
-    base = BASE_CONTEXTO.format(
-        candidato=metadatos.get("candidato", "No especificado"),
-        evento=metadatos.get("evento", "No especificado"),
-        audiencia=metadatos.get("audiencia", "No especificada"),
-        medio=metadatos.get("medio", "No especificado"),
-        fecha=metadatos.get("fecha", "No especificada"),
-        metricas=json.dumps(metricas, ensure_ascii=False, indent=2),
-        texto=texto
-    )
-    prompt = PROMPTS[modulo].format(base=base)
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}]
+        key = get_clean_api_key(api_key)
+        if not key:
+            return {"ok": False, "error": "API Key de Anthropic no configurada. Ingrésala en el panel de YouTube o en las variables de entorno de Railway (ANTHROPIC_API_KEY)."}
+            
+        base = BASE_CONTEXTO.format(
+            candidato=metadatos.get("candidato") or "No especificado",
+            evento=metadatos.get("evento") or "No especificado",
+            audiencia=metadatos.get("audiencia") or "No especificada",
+            medio=metadatos.get("medio") or "No especificado",
+            fecha=metadatos.get("fecha") or "No especificada",
+            metricas=json.dumps(metricas, ensure_ascii=False, indent=2),
+            texto=texto
         )
-        raw = response.content[0].text.strip()
+        prompt = PROMPTS[modulo].format(base=base)
+
+        with httpx.Client(verify=_SSL_VERIFY, timeout=300.0) as http_client:
+            client = anthropic.Anthropic(api_key=key, http_client=http_client)
+            raw = call_claude_with_fallback(client, prompt, SONNET_MODELS, max_tokens=8192)
+
         try:
             return {"ok": True, "data": json.loads(raw)}
         except json.JSONDecodeError:
-            clean = raw.replace("```json", "").replace("```", "").strip()
+            clean = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+            clean = re.sub(r'\s*```$', '', clean, flags=re.MULTILINE).strip()
             return {"ok": True, "data": json.loads(clean)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 @app.post("/analizar/metrico")
 def analizar_metrico(req: AnalizarRequest):
-    return {"metricas": calcular_metricas(req.texto)}
+    try:
+        return {"metricas": calcular_metricas(req.texto)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al calcular métricas: {str(e)}")
 
 @app.post("/analizar/todo")
 def analizar_todo(req: AnalizarRequest):
-    metricas = calcular_metricas(req.texto)
-    resultados = {"metricas": metricas}
-    metadatos_dict = req.metadatos.model_dump()
-    
-    # Ejecutar consultas a Claude en PARALELO para ahorrar tiempo.
-    # max_workers=3 para evitar 429 Rate Limit en cuentas tier 1.
-    # Módulos activos: frases_clave, marcos_narrativos, estilo, potencial_digital, stakeholders, marco_teorico.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        f2m = {
-            executor.submit(ejecutar_modulo, modulo, req.texto, metadatos_dict, metricas, req.api_key): modulo
-            for modulo in PROMPTS
-        }
-        for future in concurrent.futures.as_completed(f2m):
-            modulo = f2m[future]
-            resultados[modulo] = future.result()
-            
-    return resultados
+    try:
+        metricas = calcular_metricas(req.texto)
+        resultados = {"metricas": metricas}
+        metadatos_dict = get_dict_from_model(req.metadatos)
+        
+        # Ejecutar consultas a Claude en PARALELO para ahorrar tiempo.
+        # max_workers=3 para evitar 429 Rate Limit en cuentas tier 1.
+        # Módulos activos: frases_clave, marcos_narrativos, estilo, potencial_digital, stakeholders, marco_teorico.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            f2m = {
+                executor.submit(ejecutar_modulo, modulo, req.texto, metadatos_dict, metricas, req.api_key): modulo
+                for modulo in PROMPTS
+            }
+            for future in concurrent.futures.as_completed(f2m):
+                modulo = f2m[future]
+                try:
+                    resultados[modulo] = future.result()
+                except Exception as e:
+                    resultados[modulo] = {"ok": False, "error": str(e)}
+                
+        return resultados
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error en análisis: {str(e)}")
 
 @app.post("/analizar/{modulo}")
 def analizar_modulo(modulo: str, req: AnalizarRequest):
     if modulo not in PROMPTS:
         return {"error": f"Módulo '{modulo}' no existe"}
-    metricas = calcular_metricas(req.texto)
-    return ejecutar_modulo(modulo, req.texto, req.metadatos.model_dump(), metricas, api_key=req.api_key)
+    try:
+        metricas = calcular_metricas(req.texto)
+        metadatos_dict = get_dict_from_model(req.metadatos)
+        return ejecutar_modulo(modulo, req.texto, metadatos_dict, metricas, api_key=req.api_key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en módulo {modulo}: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
