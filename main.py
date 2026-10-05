@@ -253,9 +253,8 @@ def limpiar_texto(req: CleanRequest):
             
         def clean_chunk(chunk: str) -> str:
             prompt = PROMPT_LIMPIEZA.format(texto=chunk)
-            with httpx.Client(verify=_SSL_VERIFY, timeout=300.0) as http_client:
-                client = anthropic.Anthropic(api_key=key, http_client=http_client)
-                return call_claude_with_fallback(client, prompt, HAIKU_MODELS, max_tokens=2048)
+            client = anthropic.Anthropic(api_key=key, timeout=300.0)
+            return call_claude_with_fallback(client, prompt, HAIKU_MODELS, max_tokens=2048)
             
         chunks = chunk_text_for_cleaning(req.texto, word_chunk=800)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -535,9 +534,8 @@ def ejecutar_modulo(modulo: str, texto: str, metadatos: dict, metricas: dict, ap
         )
         prompt = PROMPTS[modulo].format(base=base)
 
-        with httpx.Client(verify=_SSL_VERIFY, timeout=300.0) as http_client:
-            client = anthropic.Anthropic(api_key=key, http_client=http_client)
-            raw = call_claude_with_fallback(client, prompt, SONNET_MODELS, max_tokens=8192)
+        client = anthropic.Anthropic(api_key=key, timeout=300.0)
+        raw = call_claude_with_fallback(client, prompt, SONNET_MODELS, max_tokens=8192)
 
         try:
             return {"ok": True, "data": json.loads(raw)}
